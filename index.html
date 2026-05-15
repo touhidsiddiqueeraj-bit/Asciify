@@ -1316,31 +1316,30 @@ convertBtn.addEventListener('click', async () => {
   const videoURL = selectedFile ? URL.createObjectURL(selectedFile) : urlInput.value.trim();
   let audioEl=null, gainNode=null, analyser=null, analyserData=null, audioCtx=null;
 
-  // Pre-decode audio buffer for visualizer and output track
+  // ── Audio setup ──
   let audioBuf = null;
+
+  // Always decode audio if visualizer is active (independent of includeAudio flag)
+  if (s.visualizer !== 'none') {
+    try {
+      log('Decoding audio for visualizer...', '');
+      audioBuf = await decodeVideoAudio(videoURL);
+      if (audioBuf) {
+        log(`Audio decoded: ${audioBuf.numberOfChannels}ch ${(audioBuf.sampleRate/1000).toFixed(1)}kHz ${audioBuf.duration.toFixed(1)}s`, 'ok');
+      }
+    } catch(e) {
+      log('Audio decode failed: ' + e.message, 'warn');
+    }
+  }
+
+  // Audio element for muxing output track (always muted — no speaker output)
   if (s.includeAudio && s.format==='webm') {
     audioEl = document.createElement('video');
     audioEl.src=videoURL;
-    audioEl.muted=true;  // Always muted — no speaker output during encode
+    audioEl.muted=true;
     audioEl.volume=Math.min(1,s.volume); audioEl.playbackRate=s.speed;
     audioEl.style.display='none';
     document.body.appendChild(audioEl);
-
-    // Decode full audio into a PCM AudioBuffer for frame-accurate visualizer sampling
-    if (s.visualizer!=='none') {
-      try {
-        log('Decoding audio for visualizer...', '');
-        const resp = await fetch(videoURL);
-        const arrayBuf = await resp.arrayBuffer();
-        const tmpCtx = new AudioContext();
-        audioBuf = await tmpCtx.decodeAudioData(arrayBuf);
-        tmpCtx.close();
-        log(`Audio decoded: ${audioBuf.numberOfChannels}ch ${audioBuf.sampleRate}Hz`, 'ok');
-      } catch(e) {
-        log('Audio decode failed — visualizer disabled: ' + e.message, 'warn');
-        audioBuf = null;
-      }
-    }
   }
 
   try {
@@ -1371,6 +1370,110 @@ convertBtn.addEventListener('click', async () => {
 });
 
 // ─────────────────────────────────────────────
+//  SHARED FFT-BASED AUDIO SAMPLER
+//  Called by both single-file and batch encoders.
+//  Returns Uint8Array(32) of frequency magnitudes (0–255) at time t seconds.
+// ─────────────────────────────────────────────
+function samplePCMAtTime(audioBuf, visualizer, t) {
+  if (!audioBuf || visualizer === 'none') return null;
+  const sr = audioBuf.sampleRate;
+
+  // Mix to mono
+  let pcm;
+  if (audioBuf.numberOfChannels >= 2) {
+    const L = audioBuf.getChannelData(0), R = audioBuf.getChannelData(1);
+    pcm = new Float32Array(L.length);
+    for (let i = 0; i < L.length; i++) pcm[i] = (L[i] + R[i]) * 0.5;
+  } else {
+    pcm = audioBuf.getChannelData(0);
+  }
+
+  const N = 1024;
+  const startSample = Math.max(0, Math.min(pcm.length - N, Math.floor(t * sr)));
+  const numBins = 32;
+  const result = new Uint8Array(numBins);
+
+  // Hann window
+  const re = new Float32Array(N);
+  const im = new Float32Array(N);
+  for (let i = 0; i < N; i++) {
+    const hann = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / (N - 1));
+    re[i] = (pcm[startSample + i] || 0) * hann;
+  }
+
+  // Cooley-Tukey in-place radix-2 FFT
+  let j = 0;
+  for (let i = 1; i < N; i++) {
+    let bit = N >> 1;
+    while (j & bit) { j ^= bit; bit >>= 1; }
+    j ^= bit;
+    if (i < j) {
+      let tmp = re[i]; re[i] = re[j]; re[j] = tmp;
+      tmp = im[i]; im[i] = im[j]; im[j] = tmp;
+    }
+  }
+  for (let len = 2; len <= N; len <<= 1) {
+    const ang = -2 * Math.PI / len;
+    const wRe = Math.cos(ang), wIm = Math.sin(ang);
+    for (let i = 0; i < N; i += len) {
+      let curRe = 1, curIm = 0;
+      for (let k = 0; k < len >> 1; k++) {
+        const uRe = re[i+k], uIm = im[i+k];
+        const vRe = re[i+k+(len>>1)] * curRe - im[i+k+(len>>1)] * curIm;
+        const vIm = re[i+k+(len>>1)] * curIm + im[i+k+(len>>1)] * curRe;
+        re[i+k]         = uRe + vRe;  im[i+k]         = uIm + vIm;
+        re[i+k+(len>>1)] = uRe - vRe; im[i+k+(len>>1)] = uIm - vIm;
+        const tmpRe = curRe * wRe - curIm * wIm;
+        curIm = curRe * wIm + curIm * wRe;
+        curRe = tmpRe;
+      }
+    }
+  }
+
+  // Map to 32 log-spaced bands (80 Hz – 18 kHz)
+  const nyquist = sr / 2;
+  const freqMin = 80, freqMax = Math.min(18000, nyquist);
+  for (let b = 0; b < numBins; b++) {
+    const fLow  = freqMin * Math.pow(freqMax / freqMin,  b      / numBins);
+    const fHigh = freqMin * Math.pow(freqMax / freqMin, (b + 1) / numBins);
+    const kLow  = Math.max(1,       Math.floor(fLow  / nyquist * N / 2));
+    const kHigh = Math.min(N/2 - 1, Math.ceil (fHigh / nyquist * N / 2));
+    let energy = 0, count = 0;
+    for (let k = kLow; k <= kHigh; k++) {
+      energy += Math.sqrt(re[k]*re[k] + im[k]*im[k]);
+      count++;
+    }
+    energy = count > 0 ? energy / count / (N / 2) : 0;
+    result[b] = Math.min(255, Math.floor(energy * 800));
+  }
+  return result;
+}
+
+// ─────────────────────────────────────────────
+//  AUDIO DECODE — fetch blob URL → decodeAudioData
+//  blob: URLs can be fetched multiple times within the same page session.
+//  decodeAudioData handles mp4/webm/mov audio tracks natively.
+// ─────────────────────────────────────────────
+async function decodeVideoAudio(videoURL) {
+  try {
+    const resp = await fetch(videoURL);
+    if (!resp.ok) throw new Error('fetch failed: ' + resp.status);
+    const arrayBuf = await resp.arrayBuffer();
+    const actx = new (window.AudioContext || window.webkitAudioContext)();
+    return new Promise((resolve) => {
+      actx.decodeAudioData(
+        arrayBuf,
+        (buf) => { actx.close(); resolve(buf); },
+        (err)  => { actx.close(); resolve(null); }
+      );
+    });
+  } catch(e) {
+    log('decodeVideoAudio: ' + e.message, 'warn');
+    return null;
+  }
+}
+
+// ─────────────────────────────────────────────
 //  WEBM ENCODE — two-phase: pre-render then playback-pace
 //
 //  Phase 1: Seek+render each frame as fast as possible into ImageBitmap[].
@@ -1381,31 +1484,11 @@ convertBtn.addEventListener('click', async () => {
 // ─────────────────────────────────────────────
 async function convertToWebm(s, dims, totalFrames, frameInterval, outputFps, audioEl, audioBuf, tS, tE) {
 
-  // ── PCM visualizer sampler — samples AudioBuffer at exact frame time ──
-  // FFT size 64 → 32 frequency bins. We simulate what AnalyserNode would return
-  // by computing RMS energy in frequency bands from raw PCM samples.
-  function sampleAudioAtTime(t, fftSize) {
-    if (!audioBuf || s.visualizer === 'none') return null;
-    const sr = audioBuf.sampleRate;
-    const ch = audioBuf.getChannelData(0);
-    const winSamples = Math.floor(sr / 30);  // ~33ms window
-    const startSample = Math.max(0, Math.floor(t * sr));
-    const endSample = Math.min(ch.length, startSample + winSamples);
-    const bins = fftSize / 2;
-    const result = new Uint8Array(bins);
-    // Split window into freq bands (log-ish spread)
-    const bandSize = Math.max(1, Math.floor((endSample - startSample) / bins));
-    for (let b = 0; b < bins; b++) {
-      const s0 = startSample + b * bandSize;
-      const s1 = Math.min(endSample, s0 + bandSize);
-      let rms = 0;
-      for (let i = s0; i < s1; i++) rms += ch[i] * ch[i];
-      rms = Math.sqrt(rms / Math.max(1, s1 - s0));
-      // Scale: typical speech/music RMS ~0.05–0.3, map to 0–255 with boost
-      result[b] = Math.min(255, Math.floor(rms * 800));
-    }
-    return result;
+  // ── PCM visualizer sampler — calls shared FFT function ──
+  function sampleAudioAtTime(t) {
+    return samplePCMAtTime(audioBuf, s.visualizer, t);
   }
+
 
   // ── PHASE 1: Pre-render all frames ──
   setStatus('RENDERING FRAMES...', 'active');
@@ -1427,7 +1510,7 @@ async function convertToWebm(s, dims, totalFrames, frameInterval, outputFps, aud
     await new Promise(res => { videoEl.onseeked = res; });
 
     // Sample audio PCM at this frame's timestamp for visualizer
-    const vizData = sampleAudioAtTime(srcT, 64);
+    const vizData = sampleAudioAtTime(srcT);
 
     await drawFrame(tmpCtx, s, dims, vizData);
     const bmp = await createImageBitmap(tmpCanvas);
@@ -1839,24 +1922,8 @@ Files will be processed one at a time.`);
 // ── Batch version of convertToWebm with progress callback ──
 async function convertToWebmBatch(s, dims, totalFrames, frameInterval, outputFps, audioEl, audioBuf, tS, tE, onProgress, label) {
   function sampleAudioAtTime(t) {
-    if (!audioBuf || s.visualizer === 'none') return null;
-    const sr = audioBuf.sampleRate;
-    const ch = audioBuf.getChannelData(0);
-    const winSamples = Math.floor(sr / 30);
-    const startSample = Math.max(0, Math.floor(t * sr));
-    const endSample = Math.min(ch.length, startSample + winSamples);
-    const bins = 32;
-    const result = new Uint8Array(bins);
-    const bandSize = Math.max(1, Math.floor((endSample - startSample) / bins));
-    for (let b = 0; b < bins; b++) {
-      const s0 = startSample + b * bandSize;
-      const s1 = Math.min(endSample, s0 + bandSize);
-      let rms = 0;
-      for (let i = s0; i < s1; i++) rms += ch[i] * ch[i];
-      rms = Math.sqrt(rms / Math.max(1, s1 - s0));
-      result[b] = Math.min(255, Math.floor(rms * 800));
-    }
-    return result;
+    // Reuse the same FFT-based sampler logic from main encoder
+    return samplePCMAtTime(audioBuf, s.visualizer, t);
   }
 
   const tmpCanvas = document.createElement('canvas');
