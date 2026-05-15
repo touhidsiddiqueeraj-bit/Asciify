@@ -1,4 +1,4 @@
-ASCIIFY v3.3
+ASCIIFY
 Video → ASCII Art Converter
 Pure client-side, GPU-accelerated, no uploads.
 
